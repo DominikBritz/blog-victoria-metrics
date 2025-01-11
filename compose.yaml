@@ -1,0 +1,200 @@
+services:
+  # vector is logs collector. It collects logs according to vector.yaml
+  # and forwards them to VictoriaLogs
+  vector:
+    image: docker.io/timberio/vector:latest-distroless-libc
+    container_name: vector
+    hostname: homeserver
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+      - type: bind
+        source: /var/lib/docker
+        target: /var/lib/docker
+      - ./vector.yaml:/etc/vector/vector.yaml:ro
+    depends_on:
+      - victorialogs
+    expose:
+      - 8686
+    user: root
+    restart: unless-stopped
+    networks:
+      - backend
+  #  VictoriaLogs instance, a single process responsible for
+  #  storing logs and serving read queries.
+  victorialogs:
+    container_name: victorialogs
+    hostname: victorialogs
+    image: victoriametrics/victoria-logs:latest
+    command:
+      - --storageDataPath=/vlogs
+      - --httpListenAddr=:9428
+      - --retentionPeriod=${RETENTION_PERIOD}
+      - --retention.maxDiskSpaceUsageBytes=${RETENTION_MAXDISKSPACE}
+    volumes:
+      - ./vldata:/vlogs
+    expose:
+      - 9428
+    restart: unless-stopped
+    networks:
+      - backend
+  # VictoriaMetrics instance, a single process responsible for
+  # storing metrics and serve read requests.
+  victoriametrics:
+    container_name: victoriametrics
+    hostname: victoriametrics
+    image: victoriametrics/victoria-metrics:stable
+    expose:
+      - 8428
+      - 8089
+      - 8089/udp
+      - 2003
+      - 2003/udp
+      - 4242
+    volumes:
+      - ./vmdata:/storage
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - --storageDataPath=/storage
+      - --graphiteListenAddr=:2003
+      - --opentsdbListenAddr=:4242
+      - --httpListenAddr=:8428
+      - --influxListenAddr=:8089
+      - --vmalert.proxyURL=http://vmalert:8880
+      - --promscrape.config=/etc/prometheus/prometheus.yml
+      - --retentionPeriod=${RETENTION_PERIOD}
+      #- --retention.maxDiskSpaceUsageBytes=30GiB # Not supported for metrics
+    networks:
+      - backend
+    restart: unless-stopped
+  # Grafana instance configured with VictoriaMetrics as datasource
+  grafana:
+    container_name: grafana
+    hostname: grafana
+    image: grafana/grafana-oss:latest
+    depends_on:
+      - victoriametrics
+    expose:
+      - 3000
+    volumes:
+      - ./grafana:/var/lib/grafana
+      - ./provisioning/datasources/victoriametrics-logs-datasource:/etc/grafana/provisioning/datasources
+      - ./provisioning/datasources/prometheus-datasource/single.yml:/etc/grafana/provisioning/datasources/single.yml
+      #- ./provisioning/dashboards:/etc/grafana/provisioning/dashboards
+    environment:
+      - GF_INSTALL_PLUGINS=https://github.com/VictoriaMetrics/victorialogs-datasource/releases/download/${VLDATASOURCE_VERSION}/victoriametrics-logs-datasource-${VLDATASOURCE_VERSION}.zip;victoriametrics-logs-datasource
+      - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=victoriametrics-logs-datasource
+    networks:
+      - backend
+      - caddy_caddynet
+    restart: unless-stopped
+  # vmauth is a router and balancer for HTTP requests.
+  # It proxies query requests from vmalert to either VictoriaMetrics or VictoriaLogs,
+  # depending on the requested path.
+  vmauth:
+    container_name: vmauth
+    hostname: vmauth
+    image: victoriametrics/vmauth:stable
+    depends_on:
+      - victoriametrics
+      - victorialogs
+    volumes:
+      - ./auth-mixed-datasource.yml:/etc/auth.yml
+    command:
+      - --auth.config=/etc/auth.yml
+    expose:
+      - 8427
+    networks:
+      - backend
+    restart: unless-stopped
+    # vmalert executes alerting and recording rules
+  vmalert:
+    container_name: vmalert
+    hostname: vmalert
+    image: victoriametrics/vmalert:stable
+    depends_on:
+      - victoriametrics
+      - alertmanager
+      - vmauth
+    expose:
+      - 8880
+    volumes:
+      - ./rules/alerts.yml:/etc/alerts/alerts.yml
+      - ./rules/alerts-vlogs.yml:/etc/alerts/vlogs.yml
+      - ./rules/alerts-health.yml:/etc/alerts/alerts-health.yml
+      - ./rules/alerts-vmalert.yml:/etc/alerts/alerts-vmalert.yml
+      - ./rules/vlogs-example-alerts.yml:/etc/alerts/vlogs-example-alerts.yml
+    command:
+      - --datasource.url=http://vmauth:8427/
+      - --remoteRead.url=http://victoriametrics:8428/
+      - --remoteWrite.url=http://victoriametrics:8428/
+      - --notifier.url=http://alertmanager:9093/
+      - --rule=/etc/alerts/*.yml
+      - --external.url=${GRAFANA_URL}
+    networks:
+      - backend
+    restart: unless-stopped
+    # alertmanager receives alerting notifications from vmalert
+    # and distributes them according to --config.file.
+  alertmanager:
+    container_name: alertmanager
+    hostname: alertmanager
+    image: prom/alertmanager:latest
+    volumes:
+      - ./alertmanager.yml:/config/alertmanager.yml
+    command:
+      - --config.file=/config/alertmanager.yml
+    expose:
+      - 9093
+    networks:
+      - backend
+    restart: unless-stopped
+  node-exporter:
+    container_name: node-exporter
+    hostname: node-exporter
+    image: prom/node-exporter:latest
+    restart: unless-stopped
+    networks:
+      backend: null # backend communications
+    expose:
+      - 9100
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - /etc/node-exporter:/etc/node-exporter:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.rootfs=/rootfs
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+      - --collector.textfile.directory=/etc/node-exporter
+  cadvisor:
+    container_name: cadvisor
+    hostname: cadvisor
+    image: gcr.io/cadvisor/cadvisor:${CADVISOR_VERSION}
+    restart: unless-stopped
+    privileged: true
+    networks:
+      backend: null # backend communications
+      caddy_caddynet: null # frontend communications (web UI)    
+    expose:
+      - 8080
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/machine-id:/etc/machine-id:ro
+      - /:/rootfs:ro
+      - /dev/disk/:/dev/disk:ro
+      - /sys:/sys:ro
+      - /var/run:/var/run:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    command:
+      - --storage_duration=5m0s
+      - --housekeeping_interval=60s
+      - --docker_only=true
+      - --enable_metrics=cpu,memory,network
+networks:
+  backend: null
+  caddy_caddynet:
+    external: true
