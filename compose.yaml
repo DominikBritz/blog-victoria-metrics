@@ -4,7 +4,7 @@ services:
   vector:
     image: docker.io/timberio/vector:latest-distroless-libc
     container_name: vector
-    hostname: homeserver
+    hostname: ${VECTOR_HOSTNAME}
     volumes:
       - type: bind
         source: /var/run/docker.sock
